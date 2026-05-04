@@ -9,10 +9,9 @@ import controlled_degradations
 import edge_detectors
 import result
 import os
+import threading
+import cv2
 
-
-##### Remaining for this file: removing logs, update naming conventions for annotated masks
-##### need to find dataset with annotated masks or way to convert ISIC or kaggle dataset
 
 ### Purpose of GUI: Example images for visualization, while showing entire results for whole dataset
 ## GUI Structure:
@@ -22,7 +21,6 @@ import os
 class GUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        # RBD-SLDI
         self.minsize(1200, 800)
 
         # placeholder values to carry the imgpath of the currently targeted image
@@ -46,14 +44,17 @@ class GUI(tk.Tk):
         self.lastdegradation = None
         self.lastedge = None
 
+        # persistent references to re-usable control frames (built once in completeGUI)
+        self._controls_built = False
+
         # custom close protocol
         self.protocol("WM_DELETE_WINDOW", self.rmtemp)
 
-        # gui title updating protocol setup for acting on generated events
-        self.processtimer = 0
-        titletext = "Robust Boundary Detection for Skin Lesions in Dermoscopic Images"
-        self.title(titletext)
-        self.bind("<<Processing>>", lambda e: [self.updatetitle(e, titletext)])
+        # title management: track number of active processing calls so the
+        # "Processing..." suffix is only removed when all of them have finished
+        self._processing_count = 0
+        self._base_title = "Robust Boundary Detection for Skin Lesions in Dermoscopic Images"
+        self.title(self._base_title)
 
         # creating first GUI frame for image selector
         # start with canvas for scrollbar
@@ -65,188 +66,167 @@ class GUI(tk.Tk):
 
         # build frame with canvas
         selectorframe = tk.Frame(canvas, width=200, height=200)
-        canvas.create_window((0,0), window=selectorframe, anchor="nw")
-        selectorframe.bind("<Configure>",lambda e: [(canvas.configure(scrollregion=canvas.bbox("all")))])
+        canvas.create_window((0, 0), window=selectorframe, anchor="nw")
+        selectorframe.bind("<Configure>",
+                           lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         selectorframe.grid(row=0, column=0, sticky="nsew", padx=10)
         selectorframe.grid_propagate(False)
 
         # recursively add buttons for every image in selector frame
-        tk.Label(selectorframe,text="Available Images:").grid(row=0, column=0)
+        tk.Label(selectorframe, text="Available Images:").grid(row=0, column=0)
         imagedirectory = Path("image-loader")
 
-        # create iteration variables, iteration for button spacing, buttoniteration for reducing # of buttons
+        # create iteration variables:
+        #   iteration        -> button row index
+        #   buttoniteration  -> counts all dataset images to thin out displayed buttons
         iteration = 1
         buttoniteration = 1
 
-        # list of imagepaths for evaluations of entire dataset
+        # list of image paths for evaluation of entire dataset
         self.dataset = []
         if not any(imagedirectory.iterdir()):
-            tk.messagebox.showwarning(title="Warning", message="Please enter dataset into the 'image-loader' directory.")
+            tk.messagebox.showwarning(
+                title="Warning",
+                message="Please enter dataset into the 'image-loader' directory.")
             self.rmtemp()
-        ###
-        print("Loading images from: image-loader")
-        ###
+
         for images in imagedirectory.iterdir():
-            # button label name
             imagename = images.name
 
-            # prevent additional assets from dataset from entering the evaluation dataset
-            if imagename[-16:] == '_superpixels.png':
-                ###
-                print(f"Passing discrepant item: {imagename}")
-                ###
+            # filter out auxiliary ISIC dataset files
+            if imagename.endswith('_superpixels.png'):
                 continue
-            elif imagename[-13:] == '_metadata.csv':
-                ###
-                print(f"Passing csv: {imagename}")
-                ###
+            elif imagename.endswith('_metadata.csv'):
                 continue
             else:
-                # add to dataset
                 self.dataset.append(str(images))
                 buttoniteration += 1
 
-                # add only every X images as a display option - too many buttons creates performance issues
+                # show only every 25th image as a button to avoid performance issues
                 if buttoniteration % 25 == 0:
-                    # PIL thumbnail preprocessing and conversion
-                    ###
-                    print(f"Making button for: {str(images)}")
-                    ###
                     pilimage = Image.open(str(images))
-                    pilimage = pilimage.resize((25,25))
+                    pilimage = pilimage.resize((25, 25))
                     thumbnail = ImageTk.PhotoImage(pilimage)
 
-                    # button creation, passing imgpath
-                    item = tk.Button(selectorframe,image=thumbnail, text=imagename, compound = "left",
-                          command=lambda imgpath=str(images) : self.imageselect(imgpath))
+                    item = tk.Button(selectorframe, image=thumbnail, text=imagename,
+                                     compound="left",
+                                     command=lambda imgpath=str(images): self.imageselect(imgpath))
                     item.grid(row=iteration, column=0, sticky="w")
-
-                    # ensure image is persistent
                     item.image = thumbnail
 
-                    # ensure frame grows with each added image
                     selectorframe.grid(rowspan=iteration)
                     iteration += 1
 
-                    # use larger iteration to update on canvas and reconfigure scroll distance
-                    canvas.create_window((0,iteration), window=selectorframe, anchor="nw")
-                    selectorframe.configure(height=(33*iteration))
-        ###
-        print("Finished loading images from: image-loader")
-        ###
-    ## button command for selecting the image to process
-    # takes image path string as an argument
+                    canvas.create_window((0, iteration), window=selectorframe, anchor="nw")
+                    selectorframe.configure(height=(33 * iteration))
+
+    # -- title helpers --------------------------------------------------------
+
+    def _begin_processing(self):
+        """Increment the active-processing counter and update the window title."""
+        self._processing_count += 1
+        if self._processing_count == 1:
+            self.title(self._base_title + " — Processing, Please Wait…")
+
+    def _end_processing(self):
+        """Decrement the active-processing counter and restore the title when idle."""
+        self._processing_count = max(0, self._processing_count - 1)
+        if self._processing_count == 0:
+            self.title(self._base_title)
+
+    # -- image selection ------------------------------------------------------
+
     def imageselect(self, imgpath):
-        ## temp logging
-        print("Image Select Button Pushed")
-        ##
+        """Select the image to process and refresh the display."""
         self.currentimage = imgpath
         originalimg = Image.open(imgpath)
-
-        # resizing image to fit display
-        originalimg.thumbnail((200,200))
+        originalimg.thumbnail((200, 200))
         gui_img = ImageTk.PhotoImage(originalimg)
         origlabel = tk.Label(self, image=gui_img, text="Original Image:", compound="top")
         origlabel.grid(row=0, column=2, sticky="nsew")
         origlabel.image = gui_img
 
-        # build the rest of the GUI frames and buttons
-        self.completeGUI()
+        # build control panels on first use; they persist for the session
+        if not self._controls_built:
+            self.completeGUI()
+            self._controls_built = True
 
-        # propagate changes if the program is already in use
-        if self.preprocesscheck == True:
+        # propagate changes if a pipeline is already active
+        if self.preprocesscheck:
             self.preprocess(self.lastpreprocess)
 
-    ## function for building the rest of the GUI after an original image has been selected
+    # -- control panel construction (called once) -----------------------------
+
     def completeGUI(self):
-        ### additional frames for each processing type and their corresponding buttons
+        """Build the preprocessing, degradation, and edge-detection control panels.
+        Called once after the first image is selected; subsequent image selections
+        reuse the same widgets."""
+
         ## preprocessor
-        preprocessorframe = (tk.Frame(self, borderwidth=5, relief="groove",
-                                     width=200, height=200))
+        preprocessorframe = tk.Frame(self, borderwidth=5, relief="groove",
+                                     width=200, height=200)
         preprocessorframe.grid(row=0, column=3, sticky="nsew", padx=10)
         tk.Label(preprocessorframe, text="Preprocessing Tools:").grid(row=0, column=0)
-        # Gaussian Smoothing
-        gausssmooth = tk.Button(preprocessorframe, text="Gaussian Smoothing",
-                                command=lambda: self.preprocess("Gaussian Smoothing"))
-        gausssmooth.grid(row=1, column=0, sticky="nsew")
-        # Median Filtering
-        median = tk.Button(preprocessorframe, text="Median Filtering",
-                                command=lambda: self.preprocess("Median Filtering"))
-        median.grid(row=2, column=0, sticky="nsew")
-        # Bilateral Filtering
-        bilateral = tk.Button(preprocessorframe, text="Bilateral Filtering",
-                           command=lambda: self.preprocess("Bilateral Filtering"))
-        bilateral.grid(row=3, column=0, sticky="nsew")
-        # Histogram Equalization
-        histo = tk.Button(preprocessorframe, text="Histogram Equalization",
-                           command=lambda: self.preprocess("Histogram Equalization"))
-        histo.grid(row=4, column=0, sticky="nsew")
-        # CLAHE Contrast Limited Adaptive Histogram Equalization
-        clahe = tk.Button(preprocessorframe, text="Contrast Limited Adaptive Histogram Equalization",
-                           command=lambda: self.preprocess("CLAHE"))
-        clahe.grid(row=5, column=0, sticky="nsew")
-        # None
-        none = tk.Button(preprocessorframe, text="None",
-                         command=lambda: self.preprocess("None"))
-        none.grid(row=6, column=0, sticky="nsew")
+        tk.Button(preprocessorframe, text="Gaussian Smoothing",
+                  command=lambda: self.preprocess("Gaussian Smoothing")).grid(
+                      row=1, column=0, sticky="nsew")
+        tk.Button(preprocessorframe, text="Median Filtering",
+                  command=lambda: self.preprocess("Median Filtering")).grid(
+                      row=2, column=0, sticky="nsew")
+        tk.Button(preprocessorframe, text="Bilateral Filtering",
+                  command=lambda: self.preprocess("Bilateral Filtering")).grid(
+                      row=3, column=0, sticky="nsew")
+        tk.Button(preprocessorframe, text="Histogram Equalization",
+                  command=lambda: self.preprocess("Histogram Equalization")).grid(
+                      row=4, column=0, sticky="nsew")
+        tk.Button(preprocessorframe,
+                  text="Contrast Limited Adaptive Histogram Equalization",
+                  command=lambda: self.preprocess("CLAHE")).grid(
+                      row=5, column=0, sticky="nsew")
+        tk.Button(preprocessorframe, text="None",
+                  command=lambda: self.preprocess("None")).grid(
+                      row=6, column=0, sticky="nsew")
 
         ## controlled degradations
         degradationframe = tk.Frame(self, borderwidth=5, relief="groove",
                                     width=200, height=200)
         degradationframe.grid(row=0, column=4, sticky="nsew", padx=10)
         tk.Label(degradationframe, text="Controlled Degradation Tools:").grid(row=0, column=0)
-        # None
-        none = tk.Button(degradationframe, text="None",
-                               command=lambda: self.degrade("None"))
-        none.grid(row=1, column=0, sticky="nsew")
-        # Gaussian Noise
-        gaussnoise = tk.Button(degradationframe, text="Gaussian Noise",
-                                command=lambda: self.degrade("Gaussian Noise"))
-        gaussnoise.grid(row=2, column=0, sticky="nsew")
-        # Salt and Pepper Noise
-        saltpepper = tk.Button(degradationframe, text="Salt and Pepper Noise",
-                               command=lambda: self.degrade("Salt and Pepper Noise"))
-        saltpepper.grid(row=3, column=0, sticky="nsew")
-        # Blur
-        blur = tk.Button(degradationframe, text="Blur",
-                               command=lambda: self.degrade("Blur"))
-        blur.grid(row=4, column=0, sticky="nsew")
-        # Reduced Illumination
-        debright = tk.Button(degradationframe, text="Reduce Illumination",
-                         command=lambda: self.degrade("Reduce Illumination"))
-        debright.grid(row=5, column=0, sticky="nsew")
+        tk.Button(degradationframe, text="None",
+                  command=lambda: self.degrade("None")).grid(row=1, column=0, sticky="nsew")
+        tk.Button(degradationframe, text="Gaussian Noise",
+                  command=lambda: self.degrade("Gaussian Noise")).grid(
+                      row=2, column=0, sticky="nsew")
+        tk.Button(degradationframe, text="Salt and Pepper Noise",
+                  command=lambda: self.degrade("Salt and Pepper Noise")).grid(
+                      row=3, column=0, sticky="nsew")
+        tk.Button(degradationframe, text="Blur",
+                  command=lambda: self.degrade("Blur")).grid(row=4, column=0, sticky="nsew")
+        tk.Button(degradationframe, text="Reduce Illumination",
+                  command=lambda: self.degrade("Reduce Illumination")).grid(
+                      row=5, column=0, sticky="nsew")
 
         ## edge detectors
         edgeframe = tk.Frame(self, borderwidth=5, relief="groove",
                              width=200, height=200)
         edgeframe.grid(row=0, column=5, sticky="nsew", padx=10)
         tk.Label(edgeframe, text="Edge Detection Tools:").grid(row=0, column=0)
-        # Sobel
-        sobel = tk.Button(edgeframe, text="Sobel",
-                             command=lambda: self.edgedet("Sobel"))
-        sobel.grid(row=1, column=0, sticky="nsew")
-        # Prewitt
-        prewitt = tk.Button(edgeframe, text="Prewitt",
-                          command=lambda: self.edgedet("Prewitt"))
-        prewitt.grid(row=2, column=0, sticky="nsew")
-        # Laplacian of Gaussian
-        log = tk.Button(edgeframe, text="Laplacian of Gaussian",
-                          command=lambda: self.edgedet("LoG"))
-        log.grid(row=3, column=0, sticky="nsew")
-        # Canny Edge Detection
-        canny = tk.Button(edgeframe, text="Canny Edge Detection",
-                          command=lambda: self.edgedet("Canny"))
-        canny.grid(row=4, column=0, sticky="nsew")
+        tk.Button(edgeframe, text="Sobel",
+                  command=lambda: self.edgedet("Sobel")).grid(row=1, column=0, sticky="nsew")
+        tk.Button(edgeframe, text="Prewitt",
+                  command=lambda: self.edgedet("Prewitt")).grid(row=2, column=0, sticky="nsew")
+        tk.Button(edgeframe, text="Laplacian of Gaussian",
+                  command=lambda: self.edgedet("LoG")).grid(row=3, column=0, sticky="nsew")
+        tk.Button(edgeframe, text="Canny Edge Detection",
+                  command=lambda: self.edgedet("Canny")).grid(row=4, column=0, sticky="nsew")
 
-    ## function to create preprocessed image and create it's associated
+    # -- pipeline stages ------------------------------------------------------
+
     def preprocess(self, type):
-        ## temp logging
-        print("Preprocess Button Pushed")
-        ##
-        self.event_generate("<<Processing>>")
+        """Apply the selected preprocessor to the current image."""
+        self._begin_processing()
         self.nopreprocesschecker = False
 
-        # type selector
         if type == "Gaussian Smoothing":
             pre_processors.gaussSmooth(self.currentimage)
         elif type == "Median Filtering":
@@ -258,41 +238,34 @@ class GUI(tk.Tk):
         elif type == "CLAHE":
             pre_processors.CLAHE(self.currentimage)
 
-        # open processed image
         if type == "None":
             pilimg = Image.open(self.currentimage)
             self.nopreprocesschecker = True
         else:
             pilimg = Image.open('preprocessed.png')
-        self.preprocessedimage = np.asarray(pilimg)
+        self.preprocessedimage = np.asarray(pilimg.convert("RGB"))
 
-        # resizing image to fit display
         pilimg.thumbnail((200, 200))
         gui_img = ImageTk.PhotoImage(pilimg)
-        preprocesslabel = tk.Label(self, image=gui_img, text=f"{type} Preprocessed Image:", compound="top")
+        preprocesslabel = tk.Label(self, image=gui_img,
+                                   text=f"{type} Preprocessed Image:", compound="top")
         preprocesslabel.grid(row=1, column=3, sticky="nsew", padx=10)
         preprocesslabel.image = gui_img
 
-        # update leaf images
         self.preprocesscheck = True
         self.lastpreprocess = type
-        if self.degradecheck == True:
+        if self.degradecheck:
             self.degrade(self.lastdegradation)
-        self.event_generate("<<Processing>>")
+        self._end_processing()
 
-    ## function to create degraded images from preprocessed image
     def degrade(self, type):
-        ### temp logging
-        print("Degrade Button Pushed")
-        ###
-        self.event_generate("<<Processing>>")
+        """Apply the selected degradation to the preprocessed image."""
+        self._begin_processing()
         self.nodegradechecker = False
 
-        if os.path.exists("preprocessed.png") or self.nopreprocesschecker == True:
-            if self.nopreprocesschecker == True:
-                image = self.currentimage
-            else:
-                image = 'preprocessed.png'
+        if os.path.exists("preprocessed.png") or self.nopreprocesschecker:
+            image = self.currentimage if self.nopreprocesschecker else 'preprocessed.png'
+
             if type == "Gaussian Noise":
                 controlled_degradations.gaussNoise(image)
             elif type == "Salt and Pepper Noise":
@@ -301,222 +274,252 @@ class GUI(tk.Tk):
                 controlled_degradations.blur(image)
             elif type == "Reduce Illumination":
                 controlled_degradations.debright(image)
-            # open processed image
+
             if type == "None":
                 pilimg = Image.open(image)
                 self.nodegradechecker = True
             else:
                 pilimg = Image.open('degraded.png')
-            self.degradedimage = np.asarray(pilimg)
+            self.degradedimage = np.asarray(pilimg.convert("RGB"))
 
-            # resizing image to fit display
             pilimg.thumbnail((200, 200))
             gui_img = ImageTk.PhotoImage(pilimg)
-            degraded = tk.Label(self, image=gui_img, text=f"{type} Degraded Image:", compound="top")
+            degraded = tk.Label(self, image=gui_img,
+                                text=f"{type} Degraded Image:", compound="top")
             degraded.grid(row=1, column=4, sticky="nsew", padx=10)
             degraded.image = gui_img
 
-            # update leaf images
             self.degradecheck = True
             self.lastdegradation = type
-            if self.edgedetected == True:
+            if self.edgedetected:
                 self.edgedet(self.lastedge)
         else:
-            tk.messagebox.showwarning(title="Warning",message="Please select a preprocessing step to begin.")
-        self.event_generate("<<Processing>>")
+            tk.messagebox.showwarning(title="Warning",
+                                      message="Please select a preprocessing step to begin.")
+        self._end_processing()
 
-    ## function to create edge detected image from preprocessed image
     def edgedet(self, type):
-        ### temp logging
-        print("Edge Button Pushed")
-        ###
-        self.event_generate("<<Processing>>")
-        self.edgedetected = True
+        """Apply the selected edge detector to the (optionally degraded) image."""
+        self._begin_processing()
 
-        if os.path.exists("degraded.png") or self.nodegradechecker == True:
-            if self.nodegradechecker == True:
-                if self.nopreprocesschecker == True:
-                    image = self.currentimage
-                else:
-                    image = 'preprocessed.png'
+        if os.path.exists("degraded.png") or self.nodegradechecker:
+            if self.nodegradechecker:
+                image = self.currentimage if self.nopreprocesschecker else 'preprocessed.png'
             else:
                 image = 'degraded.png'
-            if type == "Prewitt":
-                edge_detectors.prewitt(image)
-            elif type == "Sobel":
+
+            if type == "Sobel":
                 edge_detectors.sobel(image)
+            elif type == "Prewitt":
+                edge_detectors.prewitt(image)
             elif type == "LoG":
                 edge_detectors.log(image)
             elif type == "Canny":
                 edge_detectors.canny(image)
 
             pilimg = Image.open('edge.png')
-            self.edgedetectedimage = np.asarray(pilimg)
+            # Edge images are grayscale; convert to RGB so they can be stacked
+            # with colour images during export without a shape mismatch
+            self.edgedetectedimage = np.asarray(pilimg.convert("RGB"))
 
-            # resizing image to fit display
             pilimg.thumbnail((200, 200))
             gui_img = ImageTk.PhotoImage(pilimg)
-            edge = tk.Label(self, image=gui_img, text=f"{type} Edge Detected Image:", compound="top")
+            edge = tk.Label(self, image=gui_img,
+                            text=f"{type} Edge Detected Image:", compound="top")
             edge.grid(row=1, column=5, sticky="nsew", padx=10)
             edge.image = gui_img
 
-            # create type for previous branch changes
             self.edgedetected = True
             self.lastedge = type
-
-            # Build final stage of GUI
             self.finalGUI()
         else:
-            tk.messagebox.showwarning(title="Warning", message="Please select a preprocessing step and degradation step (including none) to begin.")
-        self.event_generate("<<Processing>>")
-    ## complete GUI
+            tk.messagebox.showwarning(
+                title="Warning",
+                message="Please select a preprocessing step and degradation step "
+                        "(including none) to begin.")
+        self._end_processing()
+
+    # -- results panel --------------------------------------------------------
+
     def finalGUI(self):
-        self.event_generate("<<Processing>>")
+        """Build (or refresh) the results row: annotated mask, IoU overlay,
+        dataset statistics, and export buttons."""
+        self._begin_processing()
 
-        # find annotated mask and display
-        # direct original image path to annotated-masks folder for annotated mask
-        annotatedpath = "annotated-masks/"
-        annotatedpath+=self.currentimage[13:]
-        annotatedpath=annotatedpath[:-4]+'_segmentation.png'
+        # Derive annotated mask path robustly via pathlib rather than a
+        # hardcoded character-slice that assumes "image-loader/" is exactly
+        # 13 characters long
+        stem = Path(self.currentimage).stem
+        annotatedpath = f"annotated-masks/{stem}_segmentation.png"
         self.annotatedimage = annotatedpath
-        #### temp logging
-        print(self.annotatedimage)
-        ####
 
-        # display annotated mask on GUI
         imagedirectory = Path("annotated-masks")
         if not any(imagedirectory.iterdir()):
-            tk.messagebox.showwarning(title="Warning", message="Please enter ground-truth dataset into the 'annotated-masks' directory.")
+            tk.messagebox.showwarning(
+                title="Warning",
+                message="Please enter ground-truth dataset into the 'annotated-masks' directory.")
             self.rmtemp()
         else:
-            annotatedimg = Image.open(self.annotatedimage)
+            if not Path(annotatedpath).exists():
+                tk.messagebox.showwarning(
+                    title="Warning",
+                    message=f"Annotated mask not found:\n{annotatedpath}")
+                self._end_processing()
+                return
 
-            # resizing image to fit display
+            # display the contour-extracted boundary of the annotated mask
+            # (matches what is actually used for scoring — not the raw filled region)
+            anno_gray = cv2.imread(self.annotatedimage, cv2.IMREAD_GRAYSCALE)
+            contour_arr = result._mask_to_contour_edge(anno_gray)
+            # Scale 0/1 -> 0/255 and convert to RGB for display
+            contour_disp = (contour_arr * 255).astype(np.uint8)
+            annotatedimg = Image.fromarray(contour_disp, mode='L').convert('RGB')
             annotatedimg.thumbnail((200, 200))
             gui_img = ImageTk.PhotoImage(annotatedimg)
-            annotatedlabel = tk.Label(self, image=gui_img, text="Annotated Mask:", compound="top")
+            annotatedlabel = tk.Label(self, image=gui_img,
+                                      text="Annotated Mask (contour):", compound="top")
             annotatedlabel.grid(row=2, column=2, sticky="nsew")
             annotatedlabel.image = gui_img
 
-            # display iou mask with final image
-            # manually call result function with display type
-            result.iou("edge.png", self.annotatedimage, "disp")
-
-            # open new iou image and display
+            # compute and display IoU colour overlay
+            # iou() now returns a dict: {iou, precision, recall, f1}
+            metrics = result.iou("edge.png", self.annotatedimage, "disp")
             pilimg = Image.open('iou.png')
             pilimg.thumbnail((200, 200))
             gui_img2 = ImageTk.PhotoImage(pilimg)
-            ioulabel = tk.Label(self, image = gui_img2, text="Intersection over Union:", compound="top")
+            ioulabel = tk.Label(self, image=gui_img2,
+                                text=(f"IoU: {metrics['iou']:.4f}  "
+                                      f"P: {metrics['precision']:.4f}  "
+                                      f"R: {metrics['recall']:.4f}  "
+                                      f"F1: {metrics['f1']:.4f}"),
+                                compound="top")
             ioulabel.grid(row=2, column=3, sticky="nsew")
             ioulabel.image = gui_img2
 
-            # obtain dataset results
-            results = result.calculate(self.dataset, self.lastpreprocess, self.lastdegradation, self.lastedge)
-            resultslabel = tk.Label(self, text=results, compound="top")
+            # run full dataset evaluation in a background thread so the GUI
+            # stays responsive; show a live progress label while it runs
+            resultslabel = tk.Label(self,
+                                    text="Running dataset evaluation...\n(scoring image 0 of "
+                                         + str(len(self.dataset)) + ")",
+                                    compound="top", justify="left", font=("Courier", 10))
             resultslabel.grid(row=2, column=4, sticky="nsew", columnspan=2)
+            self._begin_processing()
+            self._run_calculate_async(resultslabel)
 
-            ## export buttons
-            exportframe = (tk.Frame(self, borderwidth=5, relief="groove",
-                                      width=200, height=200))
+            # export buttons (rebuilt each time to reflect the current pipeline)
+            exportframe = tk.Frame(self, borderwidth=5, relief="groove",
+                                   width=200, height=200)
             exportframe.grid(row=2, column=0, sticky="nsew", padx=10)
             tk.Label(exportframe, text="Export Options:").grid(row=0, column=0)
-            export1 = tk.Button(exportframe, text="Export Final",
-                          command=lambda: self.export("Final"))
-            export1.grid(row=1, column=0, sticky="nsew")
-            export2 = tk.Button(exportframe, text="Export Process",
-                            command=lambda: self.export("Process"))
-            export2.grid(row=2, column=0, sticky="nsew")
-            export3 = tk.Button(exportframe, text="Export Final vs Annotated Mask",
-                            command=lambda: self.export("FinalvAnno"))
-            export3.grid(row=3, column=0, sticky="nsew")
-            export4 = tk.Button(exportframe, text="Export Intersection over Union",
-                            command=lambda: self.export("IoU"))
-            export4.grid(row=4, column=0, sticky="nsew")
-        self.event_generate("<<Processing>>")
+            tk.Button(exportframe, text="Export Final",
+                      command=lambda: self.export("Final")).grid(
+                          row=1, column=0, sticky="nsew")
+            tk.Button(exportframe, text="Export Process",
+                      command=lambda: self.export("Process")).grid(
+                          row=2, column=0, sticky="nsew")
+            tk.Button(exportframe, text="Export Final vs Annotated Mask",
+                      command=lambda: self.export("FinalvAnno")).grid(
+                          row=3, column=0, sticky="nsew")
+            tk.Button(exportframe, text="Export Intersection over Union",
+                      command=lambda: self.export("IoU")).grid(
+                          row=4, column=0, sticky="nsew")
+        self._end_processing()
 
-    ## export function
+    # -- background dataset evaluation ---------------------------------------
+
+    def _run_calculate_async(self, label):
+        """Run result.calculate() on a daemon thread and update *label* on completion.
+
+        result.calculate() accepts a progress_callback(i, total) that is called
+        after each image, allowing live label updates without a duplicate loop here.
+        All processing is done in memory via the _arr pipeline — no temp files are
+        touched during batch evaluation.
+        """
+        pre             = self.lastpreprocess
+        deg             = self.lastdegradation
+        edge            = self.lastedge
+        total           = len(self.dataset)
+        dataset_snapshot = list(self.dataset)
+
+        def update_label(text):
+            """Thread-safe label update via after()."""
+            self.after(0, lambda t=text: label.config(text=t))
+
+        def on_progress(i, total):
+            update_label(
+                f"Running dataset evaluation...\n"
+                f"(scoring image {i} of {total})"
+            )
+
+        def worker():
+            try:
+                summary = result.calculate(
+                    dataset_snapshot, pre, deg, edge,
+                    progress_callback=on_progress
+                )
+                update_label(summary)
+            except Exception as exc:
+                update_label(f"Dataset evaluation failed:\n{exc}")
+            finally:
+                self.after(0, self._end_processing)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        # -- export ---------------------------------------------------------------
+
     def export(self, type):
-        ###
-        print("Export Button Pushed")
-        ###
-        # take original image name to concatenate with export strings
-        newimg = self.currentimage[13:]
-        newimg = Path(newimg).stem
+        """Save one of the four export types to a user-chosen file path."""
+        # Derive a base filename from the original image stem via pathlib
+        # (replaces the old hardcoded currentimage[13:] character slice)
+        stem = Path(self.currentimage).stem
 
         if type == "Final":
-            # change export string
-            newimg+="_Final"
-            ###
-            print(f"Saving as: {newimg}")
-            ###
-
-            # pull image from stored array
+            filename = f"{stem}_Final"
             final = Image.fromarray(self.edgedetectedimage)
+
         elif type == "Process":
-            # change export string
-            newimg += "_Process"
-            ###
-            print(f"Saving as: {newimg}")
-            ###
+            filename = f"{stem}_Process"
 
-            # open original image with 3 color channels
-            main = Image.open(self.currentimage)
-            main = main.convert("RGB")
-            main = np.asarray(main)
+            # Collect whichever pipeline stages were active, all as RGB arrays
+            main = np.asarray(Image.open(self.currentimage).convert("RGB"))
+            third = self.edgedetectedimage          # already RGB (converted in edgedet)
+            first = None if self.nopreprocesschecker  else self.preprocessedimage
+            second = None if self.nodegradechecker    else self.degradedimage
 
-            # open edge detected image array, mandatory step so no logic required
-            third = self.edgedetectedimage
+            # Stack only the stages that were used; resize any that differ in height
+            parts = [p for p in (main, first, second, third) if isinstance(p, np.ndarray)]
+            h = parts[0].shape[0]
+            resized = []
+            for p in parts:
+                if p.shape[0] != h:
+                    pil_p = Image.fromarray(p).resize(
+                        (int(p.shape[1] * h / p.shape[0]), h), Image.LANCZOS)
+                    resized.append(np.asarray(pil_p))
+                else:
+                    resized.append(p)
+            final = Image.fromarray(np.hstack(resized))
 
-            # open preprocessed and degraded image arrays, if their selection are not none
-            first = None
-            second = None
-            if self.nopreprocesschecker != True:
-                first = self.preprocessedimage
-            if self.nodegradechecker != True:
-                second = self.degradedimage
-
-            # concatenate images side by side according to which options were used
-            # if a preprocessor or degradation was not selected, it is not included
-            if isinstance(first, np.ndarray) and isinstance(second, np.ndarray):
-                exportablearray = np.hstack((main,first,second,third))
-            elif isinstance(first, np.ndarray) and not isinstance(second, np.ndarray):
-                exportablearray = np.hstack((main,first,third))
-            elif not isinstance(first, np.ndarray) and isinstance(second, np.ndarray):
-                exportablearray = np.hstack((main,second,third))
-            else:
-                exportablearray = np.hstack((main,third))
-
-            # convert to image to be saved
-            final = Image.fromarray(exportablearray)
         elif type == "FinalvAnno":
-            newimg += "_FinalvsAnnotated"
-            ###
-            print(f"Saving as: {newimg}")
-            ###
+            filename = f"{stem}_FinalvsAnnotated"
+            first = self.edgedetectedimage           # RGB
+            second = np.asarray(Image.open(self.annotatedimage).convert("RGB"))
+            if first.shape[0] != second.shape[0]:
+                h = first.shape[0]
+                second = np.asarray(
+                    Image.fromarray(second).resize(
+                        (int(second.shape[1] * h / second.shape[0]), h), Image.LANCZOS))
+            final = Image.fromarray(np.hstack((first, second)))
 
-            # pull image from stored array
-            first = self.edgedetectedimage
-
-            # pull image from stored image path
-            second = Image.open(self.annotatedimage)
-            second = second.convert("RGB")
-            second = np.asarray(second)
-
-            # combine images horizontally and convert to saveable image
-            exportablearray = np.hstack((first, second))
-            final = Image.fromarray(exportablearray)
         elif type == "IoU":
-            newimg += "_IoU"
-            ###
-            print(f"Saving as: {newimg}")
-            ###
-
-            # open iou image (Created from final gui creation steps)
+            filename = f"{stem}_IoU"
             final = Image.open("iou.png")
 
-        # save as popup
+        else:
+            return
+
         file_path = tk.filedialog.asksaveasfilename(
-            initialfile=f"{newimg}.png",
+            initialfile=f"{filename}.png",
             defaultextension=".png",
             filetypes=(("PNG files", "*.png"), ("All files", "*.*")),
             title="Export image to: "
@@ -527,33 +530,11 @@ class GUI(tk.Tk):
             except Exception as e:
                 tk.messagebox.showerror("Error", f"Failed to save image: {e}")
 
-    ## protocol functiono
-    def updatetitle(self, e, titletext):
-        # coming from not processing (0) moving to processing (1)
-        if self.processtimer == 0:
-            self.processtimer = 1
-            titletext += "- Processing, Please Wait"
-            ###
-            print(f"Changing title to: {titletext}")
-            ###
-            self.title(titletext)
-        # coming from processing (1) moving to not processing (0)
-        elif self.processtimer == 1:
-            self.processtimer = 0
-            ###
-            print(f"Changing title to: {titletext}")
-            ###
-            self.title(titletext)
+    # -- cleanup --------------------------------------------------------------
 
-    ## protocol function for destroying temporary images and gui
     def rmtemp(self):
-        if os.path.exists('preprocessed.png'):
-            os.remove('preprocessed.png')
-        if os.path.exists('degraded.png'):
-            os.remove('degraded.png')
-        if os.path.exists('edge.png'):
-            os.remove('edge.png')
-        if os.path.exists('iou.png'):
-            os.remove('iou.png')
-
+        """Remove temporary pipeline images and close the window."""
+        for tmp in ('preprocessed.png', 'degraded.png', 'edge.png', 'iou.png'):
+            if os.path.exists(tmp):
+                os.remove(tmp)
         self.destroy()
