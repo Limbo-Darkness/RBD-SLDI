@@ -4,6 +4,8 @@ import edge_detectors
 import cv2
 import numpy as np
 from pathlib import Path
+import csv
+import io
  
 # purpose of project is to evaluate entire dataset
  
@@ -341,7 +343,23 @@ def calculate(dataset, preprocessor, degradation, edge_detector,
  
     skip_detail = ("  " + ", ".join(f"{r}: {c}" for r, c in sorted(skip_reasons.items()))
                    if skip_reasons else "  none")
- 
+
+    # print the calculated results for csv importing
+    print(f"Making CSV import for: {preprocessor or 'None'}, {degradation or 'None'}, {edge_detector}")
+    print("Format: Metric,Mean,Median,Std,Min,Max")
+    csv_list = [
+        ["IoU",f"{mi:>7.4f}",f"{mdi:>7.4f}",f"{si:>7.4f}",f"{ni:>7.4f}",f"{xi:>7.4f}"],
+        ["Precision",f"{mp:>7.4f}",f"{mdp:>7.4f}",f"{sp:>7.4f}",f"{np_:>7.4f}",f"{xp:>7.4f}"],
+        ["Recall",f"{mr:>7.4f}",f"{mdr:>7.4f}",f"{sr:>7.4f}",f"{nr:>7.4f}",f"{xr:>7.4f}"],
+        ["F1",f"{mf:>7.4f}",f"{mdf:>7.4f}",f"{sf:>7.4f}",f"{nf:>7.4f}",f"{xf:>7.4f}"]
+    ]
+
+    csv_conversion = io.StringIO()
+    writer = csv.writer(csv_conversion)
+    writer.writerows(csv_list)
+    csv_string= csv_conversion.getvalue()
+    print(csv_string)
+
     return (
         f"Dataset Results\n"
         f"───────────────────────────────\n"
